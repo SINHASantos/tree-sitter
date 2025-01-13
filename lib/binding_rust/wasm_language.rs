@@ -1,17 +1,19 @@
-use crate::{ffi, Language, LanguageError, Parser};
 use std::{
     error,
-    ffi::CString,
+    ffi::{CStr, CString},
     fmt,
     mem::{self, MaybeUninit},
     os::raw::c_char,
 };
-pub use wasmtime;
 
-#[cfg(feature = "wasm")]
-pub fn test() {
-    // Force Cargo to include wasmtime-c-api as a dependency of this crate,
-    // even though it is only used by the C code.
+pub use wasmtime_c_api::wasmtime;
+
+use crate::{ffi, Language, LanguageError, Parser, FREE_FN};
+
+// Force Cargo to include wasmtime-c-api as a dependency of this crate,
+// even though it is only used by the C code.
+#[allow(unused)]
+fn _use_wasmtime() {
     wasmtime_c_api::wasm_engine_new();
 }
 
@@ -39,18 +41,19 @@ pub enum WasmErrorKind {
 }
 
 impl WasmStore {
-    pub fn new(engine: wasmtime::Engine) -> Result<Self, WasmError> {
+    pub fn new(engine: &wasmtime::Engine) -> Result<Self, WasmError> {
         unsafe {
             let mut error = MaybeUninit::<ffi::TSWasmError>::uninit();
-            let engine = Box::new(wasm_engine_t { engine });
             let store = ffi::ts_wasm_store_new(
-                Box::leak(engine) as *mut wasm_engine_t as *mut _,
+                std::ptr::from_ref::<wasmtime::Engine>(engine)
+                    .cast_mut()
+                    .cast(),
                 error.as_mut_ptr(),
             );
             if store.is_null() {
                 Err(WasmError::new(error.assume_init()))
             } else {
-                Ok(WasmStore(store))
+                Ok(Self(store))
             }
         }
     }
@@ -62,7 +65,7 @@ impl WasmStore {
             let language = ffi::ts_wasm_store_load_language(
                 self.0,
                 name.as_ptr(),
-                bytes.as_ptr() as *const c_char,
+                bytes.as_ptr().cast::<c_char>(),
                 bytes.len() as u32,
                 error.as_mut_ptr(),
             );
@@ -73,11 +76,17 @@ impl WasmStore {
             }
         }
     }
+
+    #[must_use]
+    pub fn language_count(&self) -> usize {
+        unsafe { ffi::ts_wasm_store_language_count(self.0) }
+    }
 }
 
 impl WasmError {
     unsafe fn new(error: ffi::TSWasmError) -> Self {
-        let message = CString::from_raw(error.message);
+        let message = CStr::from_ptr(error.message).to_str().unwrap().to_string();
+        (FREE_FN)(error.message.cast());
         Self {
             kind: match error.kind {
                 ffi::TSWasmErrorKindParse => WasmErrorKind::Parse,
@@ -85,12 +94,13 @@ impl WasmError {
                 ffi::TSWasmErrorKindInstantiate => WasmErrorKind::Instantiate,
                 _ => WasmErrorKind::Other,
             },
-            message: message.into_string().unwrap(),
+            message,
         }
     }
 }
 
 impl Language {
+    #[must_use]
     pub fn is_wasm(&self) -> bool {
         unsafe { ffi::ts_language_is_wasm(self.0) }
     }
@@ -127,7 +137,7 @@ impl fmt::Display for WasmError {
             WasmErrorKind::Instantiate => "Failed to instantiate wasm module",
             WasmErrorKind::Other => "Unknown error",
         };
-        write!(f, "{kind} {}", self.message)
+        write!(f, "{kind}: {}", self.message)
     }
 }
 
